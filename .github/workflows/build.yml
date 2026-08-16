@@ -1,0 +1,36 @@
+name: Build iOS dylib
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download fishhook
+        run: |
+          curl -L -o fishhook.h https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h
+          curl -L -o fishhook.c https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c
+
+      - name: Build dylib
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 \
+                -isysroot $SDK_PATH \
+                -dynamiclib \
+                -miphoneos-version-min=12.0 \
+                -Os \
+                -o libunlock.dylib \
+                unlock.c fishhook.c
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: libunlock
+          path: libunlock.dylib
