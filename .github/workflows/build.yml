@@ -25,15 +25,21 @@ jobs:
       - name: Build dylib
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK path: $SDK_PATH"
           clang -arch arm64 \
                 -isysroot $SDK_PATH \
                 -dynamiclib \
                 -miphoneos-version-min=12.0 \
                 -Os \
-                -v \
+                -Wno-implicit-function-declaration \
+                -Wno-return-type \
                 -o libunlock.dylib \
-                unlock.c fishhook.c 2>&1 | tee build.log
-          cat build.log  # in log ra để xem lỗi
+                unlock.c fishhook.c \
+                2>&1 | tee build.log
+          # In log ra để xem lỗi
+          cat build.log
+          # Kiểm tra file đã tạo chưa
+          ls -la libunlock.dylib || echo "File not found!"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
