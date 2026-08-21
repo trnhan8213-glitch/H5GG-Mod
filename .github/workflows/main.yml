@@ -1,0 +1,261 @@
+name: Build FreeFire Aimlock Dylib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Theos
+      run: |
+        sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
+        sudo chown -R $USER /opt/theos
+        echo "THEOS=/opt/theos" >> $GITHUB_ENV
+        echo "/opt/theos/bin" >> $GITHUB_PATH
+
+    - name: Install Dependencies
+      run: |
+        brew install ldid dpkg
+        sudo ln -sf /opt/homebrew/bin/ldid /usr/local/bin/ldid || true
+
+    - name: Create Tweak Directory
+      run: |
+        mkdir -p FreeFireAimlock
+        cd FreeFireAimlock
+        
+        cat > Makefile << 'EOF'
+        export THEOS_MAKE_PATH = $(THEOS)/makefiles
+        ARCHS = arm64 arm64e
+        TARGET = iphone:clang:latest:14.0
+        
+        include $(THEOS)/makefiles/common.mk
+        
+        TOOL_NAME = FreeFireAimlock
+        FreeFireAimlock_FILES = main.mm
+        FreeFireAimlock_FRAMEWORKS = UIKit CoreGraphics Foundation
+        FreeFireAimlock_CFLAGS = -fobjc-arc -O2 -std=c++17
+        FreeFireAimlock_LDFLAGS = -lstdc++ -undefined dynamic_lookup
+        
+        include $(THEOS)/makefiles/tool.mk
+        EOF
+
+    - name: Create Objective-C Code
+      run: |
+        cd FreeFireAimlock
+        cat > main.mm << 'EOF'
+        #import <UIKit/UIKit.h>
+        #import <dlfcn.h>
+        #import <objc/runtime.h>
+        #import <Foundation/Foundation.h>
+        #import <mach/mach.h>
+        #import <mach/mach_vm.h>
+        #import <mach-o/dyld.h>
+        #import <sys/sysctl.h>
+
+        #define OFFSET_BONE_HEAD_FUNC          0x00080BD5
+        #define OFFSET_BONE_HEAD_COMP          0x000A8771
+        #define OFFSET_BONE_WEIGHT_HEAD        0x001D4B8C
+
+        static mach_port_t task_port = MACH_PORT_NULL;
+        static uint64_t libil2cpp_base = 0;
+        static bool aimlock_enabled = true;
+        static float aim_smoothness = 5.0f;
+        static uint32_t current_angle = 0;
+
+        kern_return_t read_memory(uint64_t addr, void *buffer, size_t size) {
+            mach_vm_size_t out_size = 0;
+            return mach_vm_read_overwrite(task_port, addr, size, (vm_address_t)buffer, &out_size);
+        }
+
+        kern_return_t write_memory(uint64_t addr, void *buffer, size_t size) {
+            return mach_vm_write(task_port, addr, (vm_offset_t)buffer, size);
+        }
+
+        uint32_t read_uint32(uint64_t addr) {
+            uint32_t val = 0;
+            read_memory(addr, &val, 4);
+            return val;
+        }
+
+        void write_uint32(uint64_t addr, uint32_t val) {
+            write_memory(addr, &val, 4);
+        }
+
+        float read_float(uint64_t addr) {
+            float val = 0;
+            read_memory(addr, &val, 4);
+            return val;
+        }
+
+        void write_float(uint64_t addr, float val) {
+            write_memory(addr, &val, 4);
+        }
+
+        uint64_t get_module_base(const char *name) {
+            uint64_t base = 0;
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const char *path = _dyld_get_image_name(i);
+                if (path && strstr(path, name)) {
+                    base = (uint64_t)_dyld_get_image_header(i);
+                    break;
+                }
+            }
+            return base;
+        }
+
+        pid_t get_freefire_pid() {
+            pid_t pid = -1;
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+            size_t size = 0;
+            
+            sysctl(mib, 4, NULL, &size, NULL, 0);
+            struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
+            sysctl(mib, 4, procs, &size, NULL, 0);
+            
+            int count = size / sizeof(struct kinfo_proc);
+            for (int i = 0; i < count; i++) {
+                if (strcmp(procs[i].kp_proc.p_comm, "com.dts.freefireth") == 0) {
+                    pid = procs[i].kp_proc.p_pid;
+                    break;
+                }
+            }
+            free(procs);
+            return pid;
+        }
+
+        mach_port_t get_task_for_pid(pid_t pid) {
+            mach_port_t task = MACH_PORT_NULL;
+            task_for_pid(mach_task_self(), pid, &task);
+            return task;
+        }
+
+        uint64_t find_enemy_head() {
+            if (!libil2cpp_base) return 0;
+            
+            uint64_t head_func_ptr = libil2cpp_base + OFFSET_BONE_HEAD_FUNC;
+            uint32_t head_addr = read_uint32(head_func_ptr);
+            
+            if (head_addr) {
+                printf("[Aimlock] Bone head found at 0x%x\n", head_addr);
+                return (uint64_t)head_addr;
+            }
+            
+            uint64_t head_comp_ptr = libil2cpp_base + OFFSET_BONE_HEAD_COMP;
+            uint32_t head_comp_addr = read_uint32(head_comp_ptr);
+            if (head_comp_addr) {
+                printf("[Aimlock] Bone head comp found at 0x%x\n", head_comp_addr);
+                return (uint64_t)head_comp_addr;
+            }
+            
+            uint64_t head_weight_ptr = libil2cpp_base + OFFSET_BONE_WEIGHT_HEAD;
+            uint32_t head_weight_addr = read_uint32(head_weight_ptr);
+            if (head_weight_addr) {
+                printf("[Aimlock] Bone weight head found at 0x%x\n", head_weight_addr);
+                return (uint64_t)head_weight_addr;
+            }
+            
+            return 0;
+        }
+
+        void apply_aimlock() {
+            if (!aimlock_enabled) return;
+            
+            uint64_t head_addr = find_enemy_head();
+            if (!head_addr) return;
+            
+            float head_x = read_float(head_addr);
+            float head_y = read_float(head_addr + 4);
+            float head_z = read_float(head_addr + 8);
+            
+            printf("[Aimlock] Head position: %.2f %.2f %.2f\n", head_x, head_y, head_z);
+        }
+
+        void *aimlock_thread(void *arg) {
+            while (1) {
+                if (aimlock_enabled) {
+                    apply_aimlock();
+                }
+                usleep(10000);
+            }
+            return NULL;
+        }
+
+        __attribute__((constructor)) void init_freefire_aimlock() {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                printf("[Aimlock] ========== AIMLOCK DYLIB LOADED ==========\n");
+                
+                pid_t pid = get_freefire_pid();
+                if (pid == -1) {
+                    printf("[Aimlock] ERROR: Cannot find FreeFire process\n");
+                    return;
+                }
+                printf("[Aimlock] FreeFire PID: %d\n", pid);
+                
+                task_port = get_task_for_pid(pid);
+                if (task_port == MACH_PORT_NULL) {
+                    printf("[Aimlock] ERROR: Cannot get task port\n");
+                    return;
+                }
+                printf("[Aimlock] Task port: %d\n", task_port);
+                
+                libil2cpp_base = get_module_base("libil2cpp.so");
+                if (!libil2cpp_base) {
+                    printf("[Aimlock] ERROR: Cannot find libil2cpp.so\n");
+                    return;
+                }
+                printf("[Aimlock] libil2cpp.so base: 0x%llx\n", libil2cpp_base);
+                
+                printf("[Aimlock] Offset bone_Head (func): 0x%llx\n", libil2cpp_base + OFFSET_BONE_HEAD_FUNC);
+                printf("[Aimlock] Offset bone_Head (comp): 0x%llx\n", libil2cpp_base + OFFSET_BONE_HEAD_COMP);
+                printf("[Aimlock] Offset bone_Head (weight): 0x%llx\n", libil2cpp_base + OFFSET_BONE_WEIGHT_HEAD);
+                
+                find_enemy_head();
+                
+                pthread_t thread;
+                pthread_create(&thread, NULL, aimlock_thread, NULL);
+                pthread_detach(thread);
+                
+                printf("[Aimlock] Aimlock thread started\n");
+                printf("[Aimlock] ============================================\n");
+            });
+        }
+
+        __attribute__((destructor)) void cleanup_freefire_aimlock() {
+            printf("[Aimlock] Dylib unloaded\n");
+        }
+        EOF
+
+    - name: Build Dylib
+      run: |
+        cd FreeFireAimlock
+        export THEOS=/opt/theos
+        export PATH=/opt/theos/bin:$PATH
+        make
+
+    - name: Package Dylib
+      run: |
+        mkdir -p package
+        cp FreeFireAimlock/.theos/obj/arm64/FreeFireAimlock package/FreeFireAimlock.dylib
+        
+        cd package
+        cat > info.json << 'EOF'
+        {
+          "name": "FreeFireAimlock",
+          "version": "1.0.0",
+          "bundle": "com.dts.freefireth",
+          "entry": "init_freefire_aimlock"
+        }
+        EOF
+        
+        zip -r ../FreeFireAimlock.zip *
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: FreeFireAimlock
+        path: FreeFireAimlock.zip
